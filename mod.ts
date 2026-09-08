@@ -15,9 +15,10 @@
  * @example Basic setup
  * ```typescript
  * import { enableDevtools, collectAppRoutes } from '@lockness/devtools'
+ * import { isDevelopment } from '@lockness/core'
  *
  * // In your kernel.ts (dev mode only)
- * if (Deno.env.get('APP_ENV') === 'development') {
+ * if (isDevelopment()) {
  *     enableDevtools(app.getHono())  // Before app.init()
  *     await app.init({ ... })
  *     collectAppRoutes(app)  // After app.init()
@@ -41,10 +42,13 @@
  * ```
  */
 
-import type { Hono } from 'hono'
+import type { Hono, MiddlewareHandler } from '@lockness/hono'
+import { dispatcher } from '@lockness/events'
 import { devtoolsMiddleware } from './middleware.ts'
 import { renderDashboard } from './dashboard.tsx'
 import { collector } from './collector.ts'
+import { authorizeDevtools, devtoolsActive } from './gate.ts'
+import { currentRequestId } from './request_context.ts'
 import type { DevtoolsConfig, MailInfo, QueueJob, RouteInfo } from './types.ts'
 import { ComponentDependencyAnalyzer } from './utils/component_dependency_analyzer.ts'
 
@@ -58,9 +62,13 @@ let componentAnalyzer: ComponentDependencyAnalyzer | null = null
 
 /**
  * Default configuration for devtools.
+ *
+ * Covers only the operational fields. The authorization fields (`token`,
+ * `authorize`) have no default — an absent one means "not configured", which the
+ * gate resolves to the env var / loopback posture — so they are excluded here.
  * @internal
  */
-const DEFAULT_CONFIG: Required<DevtoolsConfig> = {
+const DEFAULT_CONFIG: Required<Omit<DevtoolsConfig, 'token' | 'authorize'>> = {
     enabled: true,
     basePath: '/_devtools',
     maxLogs: 1000,
@@ -112,8 +120,9 @@ interface RouteProvider {
  * @example Basic usage
  * ```typescript
  * import { enableDevtools } from '@lockness/devtools'
+ * import { isDevelopment } from '@lockness/core'
  *
- * if (Deno.env.get('APP_ENV') === 'development') {
+ * if (isDevelopment()) {
  *     enableDevtools(app.getHono())  // Before app.init()
  *     await app.init({ ... })
  *     collectAppRoutes(app)  // After app.init()
@@ -129,15 +138,53 @@ interface RouteProvider {
  * })
  * ```
  */
+/** Guards the single global `onAny` subscription (A6). */
+let eventsWired = false
+
+/**
+ * Subscribe the collector to every dispatched event, exactly once.
+ *
+ * `dispatcher()` is a process-global singleton and `enableDevtools` may be
+ * called more than once (boot step + a manual call), so a module-scope flag
+ * keeps this to a single subscription — a second would double-capture. Each
+ * event is tagged with the current request's id (undefined outside a request),
+ * and carries the listeners **registered** for it at capture time (A3).
+ */
+function wireEventCapture(): void {
+    if (eventsWired) return
+    eventsWired = true
+    const emitter = dispatcher().getEmitter()
+    dispatcher().onAny((payload: { event: string; data: unknown }) => {
+        collector.addEvent({
+            eventName: payload.event,
+            listenerCount: emitter.listenerCount(payload.event),
+            timestamp: Date.now(),
+            requestId: currentRequestId(),
+        })
+    })
+}
+
 export function enableDevtools(
     app: Hono | HonoProvider,
     config: DevtoolsConfig = {},
 ): void {
-    const cfg: Required<DevtoolsConfig> = { ...DEFAULT_CONFIG, ...config }
+    const cfg:
+        & Required<Omit<DevtoolsConfig, 'token' | 'authorize'>>
+        & Pick<DevtoolsConfig, 'token' | 'authorize'> = {
+            ...DEFAULT_CONFIG,
+            ...config,
+        }
 
-    if (!cfg.enabled) {
+    // Fail closed: mount only when devtools is explicitly active (S1). A bare
+    // `isProduction()`/`isDevelopment()` check would fail open on a no-env or
+    // compiled-without-`--allow-env` production deploy (the env name defaults to
+    // development); `devtoolsActive()` requires an explicit dev signal.
+    if (!cfg.enabled || !devtoolsActive()) {
         return
     }
+
+    // Capture every dispatched event, once (A6).
+    wireEventCapture()
 
     // Start component scanning with dependency analysis
     const analyzer = new ComponentDependencyAnalyzer()
@@ -154,19 +201,33 @@ export function enableDevtools(
     // Add middleware to collect data and inject toolbar
     honoApp.use('*', devtoolsMiddleware(cfg.showDebugBar))
 
+    // Gate every collector-facing route behind authorization (#161). The gate is
+    // applied as **per-route middleware** on each collector route rather than via
+    // a `use('${basePath}/*')` wildcard: mounted under a constrained i18n mount
+    // pattern, that wildcard `use` corrupts Hono 4.11.1's RegExpRouter route table
+    // (`undefined is not iterable` at build), breaking dev-mode boot entirely
+    // (#54 follow-up). Per-route application covers exactly the same collector
+    // routes without the wildcard. The single decider lives in gate.ts; here we
+    // only *ask* and emit the one denial shape — a `401` with an empty body.
+    const gate: MiddlewareHandler = async (c, next) => {
+        if (!(await authorizeDevtools(c, cfg))) {
+            return c.body(null, 401)
+        }
+        await next()
+    }
+
     // Dashboard route
-    honoApp.get(cfg.basePath!, (c) => {
-        console.log(`[Devtools] Dashboard route hit!`)
+    honoApp.get(cfg.basePath, gate, (c) => {
         return renderDashboard(c)
     })
 
     // API endpoints
-    honoApp.get(`${cfg.basePath}/api/data`, (c) => {
+    honoApp.get(`${cfg.basePath}/api/data`, gate, (c) => {
         return c.json(collector.getAllData())
     })
 
     // New endpoint: get component tree for a component
-    honoApp.get(`${cfg.basePath}/api/component-tree/:name`, (c) => {
+    honoApp.get(`${cfg.basePath}/api/component-tree/:name`, gate, (c) => {
         const componentName = c.req.param('name')
         if (!componentAnalyzer) {
             return c.json({ error: 'Analyzer not ready' }, 503)
@@ -175,7 +236,7 @@ export function enableDevtools(
         return c.json(tree)
     })
 
-    honoApp.post(`${cfg.basePath}/clear`, (c) => {
+    honoApp.post(`${cfg.basePath}/clear`, gate, (c) => {
         collector.clear()
         return c.json({ success: true })
     })

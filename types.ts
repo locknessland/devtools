@@ -8,6 +8,8 @@
  * @module @lockness/devtools/types
  */
 
+import type { Context } from '@lockness/hono'
+
 // =============================================================================
 // HTTP Method Types
 // =============================================================================
@@ -245,12 +247,43 @@ export interface RequestInfo {
 export interface SessionData {
     /** Unique session identifier */
     readonly id: string
-    /** Session data key-value pairs */
+    /** Session data key-value pairs (secret-looking values redacted at capture) */
     readonly data: Record<string, unknown>
+    /** Flash messages present on the session (redacted at capture) */
+    readonly flash?: Record<string, unknown>
     /** Unix timestamp when the session was created */
     readonly createdAt: number
     /** Unix timestamp when the session was last updated */
     readonly updatedAt: number
+}
+
+/**
+ * A single dispatched event captured for the Events panel.
+ *
+ * Correlated to the request that fired it via {@link requestId} (undefined for
+ * events fired outside a request, e.g. at boot). Carries the count of listeners
+ * **registered** for the event at capture time — not "fired", which the
+ * dispatcher does not expose (see #27/#90).
+ *
+ * @example
+ * ```typescript
+ * const info: EventInfo = {
+ *     eventName: 'UserRegistered',
+ *     listenerCount: 2,
+ *     timestamp: Date.now(),
+ *     requestId: 'a1b2c3',
+ * }
+ * ```
+ */
+export interface EventInfo {
+    /** The dispatched event's name. */
+    readonly eventName: string
+    /** Listeners registered for this event at capture time. */
+    readonly listenerCount: number
+    /** Unix timestamp when the event was captured. */
+    readonly timestamp: number
+    /** Id of the request that fired it, or `undefined` outside a request. */
+    readonly requestId?: string
 }
 
 // =============================================================================
@@ -407,6 +440,8 @@ export interface DevtoolsData {
     requests: RequestInfo[]
     /** Active sessions */
     sessions: SessionData[]
+    /** Captured dispatched events */
+    events: EventInfo[]
     /** Background jobs */
     queue: QueueJob[]
     /** Sent emails */
@@ -471,4 +506,43 @@ export interface DevtoolsConfig {
      * @default true
      */
     readonly showDebugBar?: boolean
+
+    /**
+     * Shared secret required to reach the gated devtools routes from any host.
+     *
+     * When set (here or via the `LOCKNESS_DEVTOOLS_TOKEN` env var), every
+     * devtools route requires an `Authorization: Bearer <token>` header that
+     * matches, compared in constant time; a configured token is **not** bypassed
+     * by the loopback default. When unset, the default loopback posture applies.
+     * Generate it with a CSPRNG and at least 128 bits of entropy — there is no
+     * per-attempt lockout, so token entropy is the only barrier.
+     *
+     * @default undefined — falls back to `LOCKNESS_DEVTOOLS_TOKEN`, else the
+     * loopback posture.
+     */
+    readonly token?: string
+
+    /**
+     * Escape hatch that lets the application decide authorization for the
+     * devtools routes with its own logic (a session check, `@lockness/auth`, an
+     * IP allowlist) without devtools depending on it.
+     *
+     * When provided it is **the** decider (it supersedes `token` and the
+     * loopback default): returning `true` allows the request, `false` denies it.
+     * It is always awaited and wrapped in a `try/catch` — a callback that throws
+     * or returns a rejected Promise denies (fail closed), never grants. It must
+     * not trust a spoofable forwarding header (`X-Forwarded-For` et al.) to
+     * *grant* access.
+     *
+     * @param c - The Hono request context for the incoming devtools request.
+     * @returns `true` to allow, `false` to deny; may be async.
+     *
+     * @example
+     * ```typescript
+     * enableDevtools(app, {
+     *   authorize: (c) => c.get('user')?.isAdmin === true,
+     * })
+     * ```
+     */
+    readonly authorize?: (c: Context) => boolean | Promise<boolean>
 }
